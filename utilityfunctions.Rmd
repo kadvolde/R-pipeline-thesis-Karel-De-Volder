@@ -1,0 +1,219 @@
+---
+title: "Utility Functions"
+author: "Karel"
+date: "12-11-2022"
+output: pdf_document
+---
+
+```{r utilityfunctions, eval=FALSE}
+#function to calculate q values from p values,
+#see false discovery rate of Benjamini and Hochberg
+qvalue <- function(p) {
+  smooth.df = 3
+  
+  if(min(p)<0 || max(p)>1) {
+    print("ERROR: p-values not in valid range.")
+    return(0)
+  }
+  
+  lambda=seq(0,0.90,0.05)
+  m <- length(p)
+  
+  pi0 <- rep(0,length(lambda))
+  for(i in 1:length(lambda)) {pi0[i] <- mean(p >= lambda[i])/(1-lambda[i])} 
+  
+  spi0 <- smooth.spline(lambda,pi0,df=smooth.df)
+  pi0 <- predict(spi0,x=max(lambda))$y
+  pi0 <- min(pi0,1)
+  
+  if(pi0 <= 0) {
+    print("ERROR: The estimated pi0 <= 0. Check that you have valid p-values.")
+    return(0)
+  }
+  
+  u <- order(p)
+  
+  qvalue.rank <- function(x) {
+    idx <- sort.list(x)
+    
+    fc <- factor(x)
+    nl <- length(levels(fc))
+    bin <- as.integer(fc)
+    tbl <- tabulate(bin)
+    cs <- cumsum(tbl)
+    
+    tbl <- rep(cs, tbl)
+    tbl[idx] <- tbl
+    
+    return(tbl)
+  }
+  
+  v <- qvalue.rank(p)
+  
+  qvalue <- pi0*m*p/v  #theoretical q-value
+  
+  qvalue[u[m]] <- min(qvalue[u[m]],1) #practical q-value
+  for(i in (m-1):1) {qvalue[u[i]] <- min(qvalue[u[i]],qvalue[u[i+1]],1)}
+  
+  return(qvalue)
+}
+
+#function to make a Manhattan plot of a GWAS result
+makeManhattanPlot = function(gwasResult, fdrLevel=0.05, object_name) {
+  un_rows <- grepl("^Un_", gwasResult[, "Chromosome"])
+  gwasResult[un_rows,"Chromosome"] <- 0 
+  chroms <- unique(gwasResult[,2])
+  chroms <- mixedsort(chroms) 
+  chroms <- ifelse(chroms == "X", "MT", ifelse(chroms == "MT", "X", chroms))
+  n.chrom <- length(chroms)
+  chrom.start <- rep(0,n.chrom)
+  chrom.mid <- rep(0,n.chrom)
+  
+  if (n.chrom > 1) {
+    for (i in 1:(n.chrom-1)) {
+      chrom.start[i+1] <- chrom.start[i] +
+        max(gwasResult[which(gwasResult[,2]==chroms[i]),3]) + 1
+      }
+  }
+  
+  x.max <-  chrom.start[n.chrom]+max(gwasResult[which(gwasResult[,2]==chroms[n.chrom]),3])
+  pointData <- gwasResult[, 1:4]
+  names(pointData) <- c('marker','chromosome', 'position', 'y')
+  pointData$x <- NA_integer_
+  pointData$colorGroup <- NA_integer_
+  
+  for (i in seq(1,n.chrom,by=2)) {
+    
+    ix <- which(pointData[,2] == chroms[i])
+    chrom.mid[i] <- median(chrom.start[i]+pointData[ix,3])
+    pointData$colorGroup[ix] <- 1
+    pointData$x[ix] <- ifelse(pointData$chromosome[ix] %in% c(0, "MT"),
+                              NA,
+                              chrom.start[i]+pointData[ix,3])
+  }
+  
+  if (n.chrom > 1) {
+    
+    for (i in seq(2,n.chrom,by=2)) {
+      
+      ix <- which(pointData[,2] == chroms[i])
+      chrom.mid[i] <- median(chrom.start[i]+pointData[ix,3])
+      pointData$colorGroup[ix] <- 2
+      pointData$x[ix] <- ifelse(pointData$chromosome[ix] %in% c(0, "MT"),
+                                NA,
+                                chrom.start[i]+pointData[ix,3])
+    }
+  }
+  
+  q.ans <- qvalue(10^-pointData$y)
+  temp <- cbind(q.ans,pointData$y)
+  temp <- temp[order(temp[,1]),]
+  if (temp[1,1]<fdrLevel) {
+    
+    temp2 <- tapply(temp[,2],temp[,1],mean)
+    qvals <- as.numeric(rownames(temp2))
+    x <- which.min(abs(qvals-fdrLevel))
+    first <- max(1,x-2)
+    last <- min(x+2,length(qvals))
+    if((last-first)<4) {
+      
+      if(length(qvals) > 3) {
+        
+        last <- first + 3
+      }
+    }
+    if((last-first)>=4) {
+      
+      splin <- smooth.spline(x=qvals[first:last],y=temp2[first:last],df=3)
+      yThreshold = stats::predict(splin,x=fdrLevel)$y
+      
+    } else {
+      
+      apFun <- approxfun(x=qvals[first:last], y = temp2[first:last], method="linear")
+      yThreshold = apFun(fdrLevel)
+    }
+  }
+  
+  ymaxlab <- ceiling(max(pointData$y))
+  
+  sign_chromosomes <- pointData[pointData$y > yThreshold,2]
+  sign_chromosomes <- unique(sign_chromosomes)
+  chroms_noMTno0 <- chroms[-c(1,41)]
+  new_chroms <- ifelse(chroms_noMTno0 %in% sign_chromosomes, chroms_noMTno0, " ")
+ 
+   p <- ggplot2::ggplot(data = pointData, ggplot2::aes(x=x, y=y,
+                                                       colour=colorGroup,
+                                                       label=marker,
+                                                       label1=chromosome,
+                                                       label2=position)) +
+    ggplot2::geom_point() +
+    ggplot2::scale_x_continuous(name='Chromosome',
+                                breaks=chrom.mid[chroms != 0 & chroms != "MT"],  
+                                labels=new_chroms,
+                                limits=c(0, x.max),
+                                expand = c(0.01, 0, 0,0))  +
+    ggplot2::ylab('-log10(p-value)') +
+    ggplot2::scale_y_continuous(limits = c(0, ymaxlab),
+                                breaks = seq(0, ymaxlab, by = 1),
+                                expand = c(0.01, 0)) +
+    ggplot2::theme(axis.text=ggplot2::element_text(size=12), legend.position = "none") +
+    ggplot2::theme(axis.text.x = element_text(size = 12),
+                   panel.grid.major = ggplot2::element_blank(),
+                   panel.grid.minor = ggplot2::element_blank(),
+                   panel.background = element_rect(fill = "white", colour = NA),
+                   axis.line = element_line(colour = "black")) +
+    ggplot2::geom_hline(yintercept=yThreshold, linetype="dashed", color = "red") 
+  
+  filename <- paste0(object_name, "MH.png")
+  ggsave(filename, p, device = "png", width = 8, height = 8, units = "in")
+}
+
+#function to create a QQ plot
+makeQQPlot = function(gwasResult, object_name) {
+  
+  remove <- (gwasResult[,4]==0)
+  if (sum(remove)>0) {
+    
+    plotData <- gwasResult[!remove,]
+    
+  } else {
+    
+    plotData <- gwasResult
+  }
+  names(plotData) <- c('marker','chromosome','position', 'y')
+  
+  plotData <- plotData[order(plotData$y, decreasing=TRUE), ]
+  n <- nrow(plotData)
+  plotData$unifp <- -log10(ppoints(n))
+  
+  df <- data.frame(x1 = 0.0, x2 = max(plotData$unifp),
+                   y1 = 0.0, y2 = max(plotData$unifp),
+                   marker=NA, chromosome=NA, position=NA)
+  
+  p <- ggplot2::ggplot(data = plotData, ggplot2::aes(x=unifp,
+                                                     y=y,
+                                                     label=marker,
+                                                     label1=chromosome,
+                                                     label2=position)) +
+    ggplot2::geom_point() +
+    ggplot2::theme(axis.text=ggplot2::element_text(size=12),
+                   axis.title=ggplot2::element_blank(),
+                   axis.line=ggplot2::element_blank(),
+                   axis.ticks=ggplot2::element_blank(),
+                   axis.text.x=element_blank(),
+                   axis.title.x=element_blank(),
+                   axis.ticks.x=element_blank(),
+                   axis.text.y=element_blank(),
+                   axis.title.y=element_blank(),
+                   axis.ticks.y=element_blank(),
+                   panel.background = element_rect(fill = "white", colour = NA)) +
+    ggplot2::geom_segment(ggplot2::aes(x = x1, y = y1, xend = x2, yend = y2),
+                          color='red',
+                          data = df) +
+    ggplot2::scale_y_continuous(sec.axis = ggplot2::sec_axis(~., name = "Secondary Y Axis")) +
+    ggplot2::scale_x_continuous(sec.axis = ~ 1 - ., name = "Secondary X Axis")
+  filename <- paste0(object_name, "QQ.png")
+  ggsave(filename, p, device = "png", width = 8, height = 8, units = "in")
+}
+
+```

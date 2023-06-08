@@ -1,0 +1,510 @@
+---
+title: "GWAS Pipeline"
+author: "Karel De Volder"
+date: "12-11-2022"
+output: pdf_document
+theme: cosmo
+---
+
+This pipeline can easily be used for additional data, with has the same format: VHLgenetics, Axiom Canine HD Array. When additional Genodata is obtained, add the right file - FinalReport_full_ped.ped - to the "Genodata" directory and rename the added new file with a number, e.g., the next one would be "FinalReport_full_ped3.ped". The phenodata should manually be added by expanding the csv file with all new phenodata.
+
+```{r Loading packages,eval = FALSE}
+library(rrBLUP)
+library(ggplot2)
+library(data.table)
+library(stringr)
+library(FactoMineR)
+library(gtools)
+library(factoextra)
+library(scatterplot3d)
+```
+
+Genotypic data exploration:
+```{r Genotypic data exploration and QC,eval = FALSE}
+#path identification
+path <- "Genodata/"
+
+#reading in data
+file_names <- list.files(path, pattern = "FinalReport_full_ped\\d?\\.ped",
+                         recursive = TRUE)
+file_list <- lapply(file_names,function(file_name){
+  fread(file = paste0(path,file_name), header = FALSE)
+})
+rawGenoData <- as.matrix(do.call(rbind,file_list))         
+
+markerInfo <- read.table(file= paste0(path,"FinalReport_full_ped.map"),
+                         header = FALSE,
+                         sep='\t',stringsAsFactors = FALSE)
+names(markerInfo) <- c("Chromosome", "Marker ID", "Genetic Distance", "Physical Position")
+
+#transforming to score matrix
+markerCnt <- dim(markerInfo)[1]
+loadingMat <- matrix(data = NA_real_,nrow = nrow(rawGenoData),ncol = markerCnt)
+colnames(loadingMat) <- markerInfo$`Marker ID`
+rownames(loadingMat) <- rawGenoData[,1]
+
+for (i in 1:markerCnt){
+  vectors <- str_split_fixed(rawGenoData[,1 + i]," ",2)
+  scoreVec1 <- vectors[,1]
+  scoreVec2 <- vectors[,2]
+  
+  freqTable <- table(c(scoreVec1,scoreVec2))
+  freqTable <- freqTable[names(freqTable)!='0']
+
+  alleleCnt <- length(freqTable)
+  if(alleleCnt == 0) {
+
+    next  
+
+  } else if (alleleCnt == 1) {
+
+    loadingMat[!(scoreVec1=='0' | scoreVec2=='0'),i] <- 0   
+
+  } else if(alleleCnt == 2) {
+
+    refAllele <- names(which.min(freqTable))
+    loadingMat[!(scoreVec1=='0' | scoreVec2=='0'),i] <- 0    
+    loadingMat[scoreVec1==refAllele,i] <- loadingMat[scoreVec1==refAllele,i] + 1  
+    loadingMat[scoreVec2==refAllele,i] <- loadingMat[scoreVec2==refAllele,i] + 1  
+
+  } else {
+
+    warning(paste0('More than 2 alleles for marker ',
+                   markerInfo$markerName[i],' at column i'))
+  }
+}
+
+#QC per sample: call rate > 0.9
+callRate <- function(x){ 1-(sum(is.na(x))/length(x)) }
+callRateVec <- apply(loadingMat,1,callRate)
+loadingMat <- loadingMat[callRateVec>=0.9,]
+
+#QC per marker: call rate > 0.8 and no markers for which only 1 allele is present
+polymorFn <- function(x){ ((sum(is.na(x))/length(x))<0.2) &
+    (length(unique(x[!is.na(x)])) > 1) }  
+polymorphicCols <- apply(loadingMat,2,polymorFn)
+loadingMat <- loadingMat[,polymorphicCols]
+
+#cbind markerInfo: make sure marker-data has same markers as genotype data, 
+#since markers were removed during QC
+intersectNames <- intersect(colnames(loadingMat), markerInfo$`Marker ID`)
+markerInfo2 <- markerInfo[match(intersectNames, markerInfo$`Marker ID`), ]
+```
+
+Phenotypic data exploration:
+```{r Phenotypic data exploration,eval = FALSE}
+#path identification
+path2 <- "Phenodata/"
+
+#reading in data
+phenotypicScores <- t(read.csv2(paste0(path2,"phenodatacsv.csv")))
+phenotypicScores <- phenotypicScores[-1,]
+
+#dogs that are not sequenced (due to too low blood quality), but have phenotypic data 
+#must be deleted from the phenotype-matrix, since they are also absent in the loadingMat 
+identifier_files <- list.files(path, pattern = ".*RelMatr\\.csv$", recursive = TRUE)
+identifier_files_list <- lapply(identifier_files,function(file_name){
+  fread(file = paste0(path,file_name), header = FALSE)
+})
+identifiers <- as.data.frame(do.call(rbind,identifier_files_list))
+identifiers$V2 <- gsub("[^0-9]", "", identifiers$V2)
+numerical_id <- as.numeric(identifiers$V2)
+all_numbers <- 1:200
+unsequenced_samples <- setdiff(all_numbers, numerical_id)
+phenotypicScoresAndSequenced <- phenotypicScores[-unsequenced_samples,]
+```
+
+Preparing the data for rrBLUP::GWAS - function:
+```{r Preparing data for rrblup:GWAS function,eval = FALSE}
+#0, 1, 2 scoring to -1, 0, 1 scoring
+genotypicScores <- loadingMat - 1 
+
+#humpty-dumpty imputation: replace missing values by the marker mean
+markerMeans <- apply(genotypicScores,2,mean,na.rm=TRUE)
+for(i in 1:ncol(genotypicScores)){
+  genotypicScores[is.na(genotypicScores[,i]), i] <- markerMeans[i]
+}
+
+#for each seperate phenotype, a matching genotype-matrix is made
+#including the individuals that have a score for this specific phenotype: 
+
+for (i in 1: 29){
+rows_to_delete <- which(phenotypicScoresAndSequenced[,i] == "/")
+COI <- phenotypicScoresAndSequenced[-rows_to_delete, i]
+
+#add identifier
+gid <- rownames(loadingMat[-rows_to_delete,])        
+phenoData <- cbind(gid,COI) 
+
+#only use individuals that are both genotyped and phenotyped
+genotypicScoresWithPhenodata <- genotypicScores[-rows_to_delete,]
+
+#add markerInfo with column order according to rrblup::GWAS helppage
+markerInfo3 <- cbind(markerInfo2$`Marker ID`,
+                     markerInfo2$Chromosome,
+                     markerInfo2$`Physical Position`)
+colnames(markerInfo3) <- c("Marker ID","Chromosome","Physical Position")
+
+genoData <- cbind(
+  markerInfo3,
+  t(genotypicScoresWithPhenodata)
+)
+
+#prepare data.frames
+phenoData <- as.data.frame(phenoData)
+phenoData[ , 2] <- as.numeric(phenoData[,2])
+
+genoData <- as.data.frame(genoData)
+t <- 3:ncol(genoData)
+genoData[ , t] <- apply(genoData[ , t], 2,            
+                    function(x) as.numeric(as.character(x)))
+
+assign(paste0("phenoData.", i), phenoData)
+l <- get(paste0("phenoData.", i))
+save(l, file = paste0("phenoData.", i, ".Rdata"))
+
+assign(paste0("genoData.", i), genoData)
+m <- get(paste0("genoData.", i))
+save(m, file = paste0("genoData.", i, ".Rdata"))
+}
+```
+
+Since it was decided to report the GWASs which exclude two odd clustering Labradors, they are also removed from the gaussianity plots, for complementary reasons. Moreover, since it was demonstrated that the rice phenotype had one extreme influencing outlier and it was decided to remove this outlier, the outlier should also be removed for the gaussianity plots.
+
+Gaussianity check of phenotypic data:
+```{r Check on gaussianity of phenotypic data,eval = FALSE}
+#this was manually checked for every seperate phenotype. 
+#However, it is possible to do this via a for-lus as well
+load("phenoData.6.Rdata")
+l <- l[!(l$gid %in% c("22CN13654_01.CEL", "23CN10622_01.CEL")),] 
+#add "23CN10619_01.CEL" (dog nr. 114) for 24 (the rice phenotype)
+
+png("histogram1.png")
+hist(l$COI,
+     main = "",
+     xlab = "Allergen-specific IgE values for cat hair")
+dev.off()
+
+png("histogram2.png")
+hist(log1p(l$COI),
+     main = "",
+     xlab = "Log(x+1) transformed allergen-specific IgE values for cat hair")
+dev.off()
+```
+
+PCA on all genotyped individuals is the most interesting thing to do. The more sequenced dogs taken up in the clustering, the more robust the classification. However, there were three dogs sequenced twice, by mistake, and these have been deleted previously by the matching of pheno- and genodata, based on the fact that a dog needs both data for its phenotype and for its genotype, the doubles were removed by not letting them have phenodata in the phenodata.csv file, but this also now needs to be taken into account when performing the clustering, so the clustering only has to be done once, and not per set of pheno- and genodata
+
+The following code block was repeated when also eight odd clustering Labradors were removed, which were identified after the first PCA (nr.62, nr. 75, nr. 76, nr. 77, nr. 79, nr. 117, nr. 189, and nr. 199).
+
+PCA and clustering:
+```{r PCA and clustering,eval = FALSE}
+#remove the three doubles (--> 189 unique labrador samples)
+genotypicScoresNoDoubles <- genotypicScores[-c(143,156,165),]  
+
+#PCA
+PCAinput <- genotypicScoresNoDoubles
+pca <- FactoMineR::PCA(PCAinput)
+
+#Clustering, in the second run, call this: hcpc3NoOuters
+hcpc3 <- FactoMineR::HCPC(pca, nb.clust = 3,graph = FALSE)
+clusters <- as.data.frame(hcpc3$data.clust$clust)
+clusters$gid <- rownames(hcpc3$data.clust)
+
+#Add cluster group number to the phenotypic data
+for (i in 1: dim(phenotypicScores)[2]){
+  object_name <- paste0("phenoData.",i)
+  load(paste0(object_name,".Rdata"))
+  #only for the phenoDataClusteredX (so the phenodata matrices are also not having these):
+  #l <- l[!(l$gid %in% c("22CN13654_01.CEL", "23CN10622_01.CEL")),]
+  #In the second run of the codeblock, this should be phenodataClusteredX
+  phenoDataClustered <- merge(l,clusters,by = "gid")    
+  save(phenoDataClustered, file = paste0("phenoDataClustered.", i, ".Rdata"))
+}
+
+#making PCA graphs, colored according to hierarchical group
+
+#join cluster assignment with PCA results
+graphdata <- clusters
+rownames(graphdata) <- clusters$gid
+pca_with_clusters <- merge(pca$ind$coord, graphdata, by = "row.names")
+
+#PCA plot 3 components
+scatterplot3d(pca_with_clusters[,2], pca_with_clusters[,3], pca_with_clusters[,4], 
+              main="PCA Results - First 3 Components with Cluster Coloring", 
+              xlab = paste0("PC1 (", round(pca$eig[1,2],2), "%)"), 
+              ylab = paste0("PC2 (", round(pca$eig[2,2],2), "%)"), 
+              zlab = paste0("PC3 (", round(pca$eig[3,2],2), "%)"), 
+              pch = 16, 
+              color = pca_with_clusters[,7])
+```
+
+The scripts below include the transformation, keep in mind that for phenotypes 27, 28, and 29 this transfomation was not necessary, and the log1p line should be removed. Moreover, for phenotype 24, one extra dog (nr. 114) should be removed for each analysis.
+
+Six GWAS repeats per phenotype:
+```{r six GWAS repeats, eval = FALSE}
+source("utilityfunctions.R")
+
+#not taking stratification into account
+for(i in 1:23){
+  object_name1 <- paste0("phenoData.",i)
+  load(paste0(object_name1,".Rdata"))
+  object_name2 <- paste0("genoData.",i)
+  load(paste0(object_name2,".Rdata"))
+  l$COI <-  log1p(l$COI)
+  
+  gwasResult <- rrBLUP::GWAS(
+    pheno = l,
+    geno = m,
+    fixed = NULL,
+    min.MAF = 0.05,
+    n.core = 40,
+    P3D = FALSE,
+    plot=FALSE
+  ) 
+  
+  assign(paste0("gwasResult.", i), gwasResult)
+  save(gwasResult, file = paste0("gwasResult.", i, ".Rdata"))   
+  obj <- get(paste0("gwasResult.", i))
+  makeQQPlot(obj, paste0("gwasResult.", i))
+  makeManhattanPlot(obj, fdrLevel=0.05, paste0("gwasResult.", i))
+}
+
+#taking stratification into account by using 3 PCs
+for(i in 1:23){
+  object_name1 <- paste0("phenoData.",i)
+  load(paste0(object_name1,".Rdata"))
+  object_name2 <- paste0("genoData.",i)
+  load(paste0(object_name2,".Rdata"))
+  l$COI <-  log1p(l$COI)
+  
+  gwasResult <- rrBLUP::GWAS(
+    pheno = l,
+    geno = m,
+    fixed = NULL,
+    n.PC = 3,
+    min.MAF = 0.05,
+    n.core = 40,
+    P3D = FALSE,
+    plot=FALSE
+  ) 
+  
+  assign(paste0("gwasResultPCs.", i), gwasResult)
+  save(gwasResult, file = paste0("gwasResultPCs.", i, ".Rdata"))   
+  obj <- get(paste0("gwasResultPCs.", i))
+  makeQQPlot(obj, paste0("gwasResultPCs.", i))
+  makeManhattanPlot(obj, fdrLevel=0.05, paste0("gwasResultPCs.", i))
+  rm(list = ls(,pattern = "^gwas"))
+}
+
+#taking stratification into account by using hierarchical cluster
+
+for(i in 1:23){
+  object_name1 <- paste0("phenoDataClustered.",i)
+  load(paste0(object_name1,".Rdata"))
+  object_name2 <- paste0("genoData.",i)
+  load(paste0(object_name2,".Rdata"))
+  phenoDataClustered$COI <- log1p(phenoDataClustered$COI)
+  
+  gwasResult <- rrBLUP::GWAS(
+    pheno = phenoDataClustered,
+    geno = m,
+    fixed = 'hcpc3$data.clust$clust',
+    min.MAF = 0.05,
+    n.core = 40,
+    P3D = FALSE,
+    plot=FALSE
+  ) 
+  
+  assign(paste0("gwasResultClustered.", i), gwasResult)
+  save(gwasResult, file = paste0("gwasResultClustered.", i, ".Rdata"))   
+  obj <- get(paste0("gwasResultClustered.", i))
+  makeQQPlot(obj, paste0("gwasResultClustered.", i))
+  makeManhattanPlot(obj, fdrLevel=0.05, paste0("gwasResultClustered.", i))
+  rm(list = ls(,pattern = "^gwas"))
+}
+
+#not taking stratification into account and two odd clustering dogs removed
+
+for(i in 1:23){
+  object_name1 <- paste0("phenoData.",i)
+  load(paste0(object_name1,".Rdata"))
+  object_name2 <- paste0("genoData.",i)
+  load(paste0(object_name2,".Rdata"))
+  
+  l <- l[!(l$gid %in% c("22CN13654_01.CEL", "23CN10622_01.CEL")),]
+  m <- m[,!(colnames(m) %in% c("22CN13654_01.CEL", "23CN10622_01.CEL"))]
+  
+  l$COI <-  log1p(l$COI)
+
+  gwasResult <- rrBLUP::GWAS(
+    pheno = l,
+    geno = m,
+    fixed = NULL,
+    min.MAF = 0.05,
+    n.core = 40,
+    P3D = FALSE,
+    plot=FALSE
+  ) 
+  
+  assign(paste0("gwasResultX.", i), gwasResult)
+  save(gwasResult, file = paste0("gwasResultX.", i, ".Rdata"))   
+  obj <- get(paste0("gwasResultX.", i))
+  makeQQPlot(obj, paste0("gwasResultX.", i))
+  makeManhattanPlot(obj, fdrLevel=0.05, paste0("gwasResultX.", i))
+  
+  rm(list = ls(,pattern = "^gwas"))
+}
+
+#taking stratification into account by using 3 PCs and two odd clustering dogs removed
+
+for(i in 1:23){
+  object_name1 <- paste0("phenoData.",i)
+  load(paste0(object_name1,".Rdata"))
+  object_name2 <- paste0("genoData.",i)
+  load(paste0(object_name2,".Rdata"))
+  
+  l <- l[!(l$gid %in% c("22CN13654_01.CEL", "23CN10622_01.CEL")),]
+  m <- m[,!(colnames(m) %in% c("22CN13654_01.CEL", "23CN10622_01.CEL"))]
+  
+  l$COI <-  log1p(l$COI)
+  
+  gwasResult <- rrBLUP::GWAS(
+    pheno = l,
+    geno = m,
+    fixed = NULL,
+    n.PC = 3,
+    min.MAF = 0.05,
+    n.core = 40,
+    P3D = FALSE,
+    plot=FALSE
+  ) 
+  
+  assign(paste0("gwasResultPCsX.", i), gwasResult)
+  save(gwasResult, file = paste0("gwasResultPCsX.", i, ".Rdata"))   
+  obj <- get(paste0("gwasResultPCsX.", i))
+  makeQQPlot(obj, paste0("gwasResultPCsX.", i))
+  makeManhattanPlot(obj, fdrLevel=0.05, paste0("gwasResultPCsX.", i))
+  rm(list = ls(,pattern = "^gwas"))
+}
+
+#taking stratification into account by using hierarchical cluster 
+#and two odd clustering dogs removed
+
+for(i in 1:23){
+  object_name1 <- paste0("phenoDataClusteredX.",i)
+  load(paste0(object_name1,".Rdata"))
+  object_name2 <- paste0("genoData.",i)
+  load(paste0(object_name2,".Rdata"))
+  
+  m <- m[,!(colnames(m) %in% c("22CN13654_01.CEL", "23CN10622_01.CEL"))]
+  
+  phenoDataClustered$COI <- log1p(phenoDataClustered$COI)
+  
+  gwasResult <- rrBLUP::GWAS(
+    pheno = phenoDataClustered,
+    geno = m,
+    fixed = 'hcpc3NoOuters$data.clust$clust',
+    min.MAF = 0.05,
+    n.core = 40,
+    P3D = FALSE,
+    plot=FALSE
+  ) 
+  
+  assign(paste0("gwasResultClusteredX.", i), gwasResult)
+  save(gwasResult, file = paste0("gwasResultClusteredX.", i, ".Rdata"))   
+  obj <- get(paste0("gwasResultClusteredX.", i))
+  makeQQPlot(obj, paste0("gwasResultClusteredX.", i))
+  makeManhattanPlot(obj, fdrLevel=0.05, paste0("gwasResultClusteredX.", i))
+  rm(list = ls(,pattern = "^gwas"))
+}
+```
+
+For the phenotypes that have significant result, the following code block can be used to gain more specific information on the significant results, such as the p-values, q-values, and explained variances. Also the reported boxplots are made at the end. This was done manually for each phenotype of interest.
+
+Checking the significant markers and making boxplots:
+```{r significant markers checked and making of the boxplots, eval = FALSE}
+source("utilityfunctions.R")
+fdrLevel <- 0.05
+load("GWASResultClusteredX.6.Rdata")
+load("phenoData.6.Rdata")
+load("genoData.6.Rdata")
+l <- l[!(l$gid %in% c("22CN13654_01.CEL", "23CN10622_01.CEL","23CN10619_01.CEL")),] 
+m <- m[,!(colnames(m) %in% c("22CN13654_01.CEL", "23CN10622_01.CEL","23CN10619_01.CEL"))] 
+#add ,"23CN10619_01.CEL" for rice
+
+q.ans <- qvalue(10^-gwasResult[,4])
+temp <- cbind(q.ans,gwasResult[,4])
+temp <- temp[order(temp[,1]),]
+  if (temp[1,1]<fdrLevel) {
+    
+    temp2 <- tapply(temp[,2],temp[,1],mean)
+    qvals <- as.numeric(rownames(temp2))
+    x <- which.min(abs(qvals-fdrLevel))
+    first <- max(1,x-2)
+    last <- min(x+2,length(qvals))
+    if((last-first)<4) {
+      
+      if(length(qvals) > 3) {
+        
+        last <- first + 3
+      }
+    }
+    if((last-first)>=4) {
+      
+      splin <- smooth.spline(x=qvals[first:last],y=temp2[first:last],df=3)
+      yThreshold = stats::predict(splin,x=fdrLevel)$y
+      
+    } else {
+      
+      apFun <- approxfun(x=qvals[first:last], y = temp2[first:last], method="linear")
+      yThreshold = apFun(fdrLevel)
+    }
+  }
+gwasResult$q <- q.ans
+sigMarkerNames <- gwasResult[gwasResult[,4] > yThreshold,]
+sigMarkerNames$COI <- 10^-sigMarkerNames$COI 
+colnames(sigMarkerNames)[4] <- "p"
+
+genos <- t(m[,-c(1,2,3)])
+y <- l$COI
+
+stat_box_data <- function(y, upper_limit = max(l$COI) * 1.15) {
+  return( 
+    data.frame(
+      y = 0.95 * upper_limit,
+      label = paste('count =', length(y), '\n',
+                    'median =', median(y), '\n')
+    )
+  )
+}
+
+sigMarkerNames$EV <- vector("logical",length(sigMarkerNames$Marker.ID))
+for(i in 1:dim(sigMarkerNames)[1]){
+  marker <- sigMarkerNames[i,1]
+  x <- genos[,marker]
+  s <- summary(lm(y~x))
+  sigMarkerNames[i,6] <- s$r.squared
+  
+  x <- round(x)
+  data <- data.frame(x,y)
+  
+  p <- ggplot(data, aes(x = factor(x), y = y)) +
+  geom_boxplot() +
+    stat_summary(
+    fun.data = stat_box_data, 
+    geom = "text", 
+    hjust = 0.5,
+    vjust = 0.9) +
+    theme_classic()
+  
+  assign(paste0("plot.", i), p)
+}
+
+View(sigMarkerNames)
+
+#boxplots: choose for each phenotype the plot.x that corresponds 
+#with the most significant result for the phenotype
+p <- plot.2 + xlab("Genotypic value for m1") + 
+  ylab("Allergen-specific IgE values for cat hair")
+ggsave("boxplot1.png", p, width = 6, height = 6, dpi = 300)
+```
